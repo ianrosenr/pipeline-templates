@@ -1,0 +1,319 @@
+# Reusable deploy pipeline. An app repo calls it like this:
+#
+#   on:
+#     push: { branches: [main] } # release + deploy
+#     pull_request: {}           # checks + snapshot images only, never deploys
+#     workflow_dispatch: {}      # manual run = check + build everything
+#   jobs:
+#     deploy:
+#       uses: ianrosenr/pipeline-templates/.github/workflows/deploy.yml@v1
+#       permissions: { contents: read, packages: write } # packages = push images + bundles to GHCR
+#       with:
+#         app: my-app
+#         components: '[{"name":"web","lang":"node","dir":".","dockerfile":"apps/web/Dockerfile","context":".","paths":"apps/web"},
+#                       {"name":"api","lang":"python","dir":"apps/api","dockerfile":"apps/api/Dockerfile","context":"apps/api","paths":"apps/api packages"}]'
+#       secrets: inherit
+#
+# Stages (each only for components whose paths changed):
+#   changes -> lint -> typecheck + test (parallel) -> build -> release (main only: bundle deploy/ -> GHCR :main)
+#   register (main only, independent): make sure homelab's Flux watches this app's bundle
+#
+# What each lang runs (in the component's "dir"):
+#   python (uv + pyproject.toml, ruff/mypy/pytest as dev deps): ruff check, ruff format --check | mypy . | pytest
+#   node   (pnpm, package.json scripts "typecheck" and "test"):  (no lint yet)                  | pnpm typecheck | pnpm test
+name: deploy
+
+on:
+  workflow_call: # = "other workflows can call me", like importing a function
+    inputs:
+      app:
+        description: "App name: used for the namespace, the Flux objects, the entry file and image names. lowercase-with-dashes."
+        type: string
+        required: true
+      components:
+        description: >-
+          JSON list, one entry per image: name, lang (python|node), dir (where checks run, default "."),
+          dockerfile, context (build folder), paths (space-separated: a change under any of these re-checks and rebuilds it).
+        type: string
+        default: '[{"name":"app","lang":"node","dir":".","dockerfile":"Dockerfile","context":".","paths":"."}]'
+    secrets:
+      HOMELAB_APP_ID: { required: true } # the homelab-deployer GitHub App
+      HOMELAB_APP_KEY: { required: true } # its private key (PEM)
+
+jobs:
+  # Which components changed? Is this a release (main) or a snapshot (PR/branch)?
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.pick.outputs.build }} # the subset of `components` to check + build
+      deploy: ${{ steps.pick.outputs.deploy }} # did deploy/ change? (config-only change still needs a release)
+      release: ${{ steps.kind.outputs.release }}
+      tag: ${{ steps.kind.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 0 } # full history, so we can diff against the previous push
+      - id: kind
+        env:
+          RELEASE: ${{ github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          SHA: ${{ github.sha }}
+        run: |
+          echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
+          if [ "$RELEASE" = true ]; then echo "tag=$SHA"; else echo "tag=snapshot-$SHA"; fi >> "$GITHUB_OUTPUT"
+      - id: pick
+        env:
+          COMPONENTS: ${{ inputs.components }}
+          # compare against: PR -> its base branch; push -> the commit before it; manual run -> nothing (= everything)
+          BEFORE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # no usable "before" commit -> everything counts as changed
+          changed() { ! git cat-file -e "${BEFORE:-none}^{commit}" 2>/dev/null || ! git diff --quiet "$BEFORE" HEAD -- "$@"; }
+          picked='[]'
+          while read -r c; do
+            read -ra paths <<<"$(jq -r .paths <<<"$c")" # "apps/api packages" -> (apps/api packages)
+            if changed "${paths[@]}"; then picked=$(jq -c --argjson c "$c" '. + [$c]' <<<"$picked"); fi
+          done < <(jq -c '.[]' <<<"$COMPONENTS")
+          if changed deploy; then deploy=true; else deploy=false; fi
+          { echo "build=$picked"; echo "deploy=$deploy"; } >> "$GITHUB_OUTPUT"
+          echo "building: $picked | deploy/ changed: $deploy"
+
+  # Stage 1: seconds-fast style checks. Fail here = nothing slower runs.
+  lint:
+    needs: changes
+    if: needs.changes.outputs.build != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: { component: "${{ fromJSON(needs.changes.outputs.build) }}" }
+    defaults:
+      run: { working-directory: "${{ matrix.component.dir || '.' }}" }
+    steps:
+      - uses: actions/checkout@v5
+      - if: matrix.component.lang == 'python'
+        uses: astral-sh/setup-uv@v6
+        with: { enable-cache: true }
+      - if: matrix.component.lang == 'python'
+        run: |
+          uv run --locked ruff check .
+          uv run --locked ruff format --check .
+      - if: matrix.component.lang != 'python'
+        run: echo "no linter for ${{ matrix.component.lang }} yet"
+
+  # Stage 2a: types. Runs in parallel with test.
+  typecheck:
+    needs: [changes, lint]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: { component: "${{ fromJSON(needs.changes.outputs.build) }}" }
+    defaults:
+      run: { working-directory: "${{ matrix.component.dir || '.' }}" }
+    steps:
+      - uses: actions/checkout@v5
+      - if: matrix.component.lang == 'python'
+        uses: astral-sh/setup-uv@v6
+        with: { enable-cache: true }
+      - if: matrix.component.lang == 'python'
+        run: uv run --locked mypy .
+      - if: matrix.component.lang == 'node'
+        uses: pnpm/action-setup@v4 # pnpm version comes from package.json "packageManager"
+      - if: matrix.component.lang == 'node'
+        uses: actions/setup-node@v5
+        with: { node-version: 24 }
+      - if: matrix.component.lang == 'node'
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run typecheck
+
+  # Stage 2b: tests. Runs in parallel with typecheck.
+  test:
+    needs: [changes, lint]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: { component: "${{ fromJSON(needs.changes.outputs.build) }}" }
+    defaults:
+      run: { working-directory: "${{ matrix.component.dir || '.' }}" }
+    steps:
+      - uses: actions/checkout@v5
+      - if: matrix.component.lang == 'python'
+        uses: astral-sh/setup-uv@v6
+        with: { enable-cache: true }
+      - if: matrix.component.lang == 'python'
+        run: uv run --locked pytest
+      - if: matrix.component.lang == 'node'
+        uses: pnpm/action-setup@v4
+      - if: matrix.component.lang == 'node'
+        uses: actions/setup-node@v5
+        with: { node-version: 24 }
+      - if: matrix.component.lang == 'node'
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run test
+
+  # Stage 3: only if every check passed. Image: ghcr.io/<owner>/<app>-<component>:<sha> (or :snapshot-<sha>)
+  build:
+    needs: [changes, typecheck, test]
+    runs-on: ubuntu-latest # GitHub's runners are x86_64, same as the VM: no cross-building needed
+    permissions: { contents: read, packages: write }
+    strategy:
+      matrix: { component: "${{ fromJSON(needs.changes.outputs.build) }}" }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # the built-in token is enough: GHCR is "its own" account's registry
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.component.context }}
+          file: ${{ matrix.component.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ inputs.app }}-${{ matrix.component.name }}:${{ needs.changes.outputs.tag }}
+          cache-from: type=gha,scope=${{ matrix.component.name }} # reuse unchanged layers from the last build
+          cache-to: type=gha,mode=max,scope=${{ matrix.component.name }}
+
+  # Stage 4 (main only): pack deploy/ + every component's image into a bundle, point :main at it. Flux deploys :main.
+  # Rollback: flux tag artifact oci://ghcr.io/<owner>/<app>-deploy:<older sha> --tag main
+  release:
+    needs: [changes, build]
+    # !failure(): any check/build failed -> no release. Runs when images were rebuilt OR only deploy/ changed.
+    if: >-
+      !cancelled() && !failure() && needs.changes.outputs.release == 'true' &&
+      (needs.changes.outputs.build != '[]' || needs.changes.outputs.deploy == 'true')
+    concurrency: { group: "release-${{ inputs.app }}" } # two merges at once: second waits, reads the first's :main
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: fluxcd/flux2/action@v2.10.0 # installs the flux CLI
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+      - name: write image list (rebuilt -> new tag, unchanged -> keep what's live)
+        env:
+          BUNDLE: ghcr.io/${{ github.repository_owner }}/${{ inputs.app }}-deploy
+          IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/${{ inputs.app }}
+          APP: ${{ inputs.app }}
+          SHA: ${{ github.sha }}
+          COMPONENTS: ${{ inputs.components }}
+          BUILT: ${{ needs.changes.outputs.build }}
+        run: |
+          live='{}'
+          if flux pull artifact "oci://$BUNDLE:main" --output "$RUNNER_TEMP/live" 2>/dev/null; then
+            live=$(yq '.data["values.yaml"]' "$RUNNER_TEMP/live/_images.yaml" | yq -o=json '.components // {}')
+          else echo "no live bundle yet (first release)"; fi
+
+          images='{}'
+          while read -r name; do
+            if jq -e --arg n "$name" 'any(.[]; .name == $n)' <<<"$BUILT" >/dev/null; then
+              img="$IMAGE_PREFIX-$name:$SHA"
+            else
+              img=$(jq -r --arg n "$name" '.[$n].image // empty' <<<"$live")
+              [ -n "$img" ] || { echo "::error::$name has never been released: run this workflow manually (builds everything)"; exit 1; }
+            fi
+            images=$(jq -c --arg n "$name" --arg i "$img" '.[$n] = {image: $i}' <<<"$images")
+          done < <(jq -r '.[].name' <<<"$COMPONENTS")
+          echo "images: $images"
+
+          # A ConfigMap the app's HelmRelease reads with valuesFrom: { kind: ConfigMap, name: <app>-images }
+          VALUES=$(jq '{components: .}' <<<"$images" | yq -p=json -o=yaml) \
+            yq -n '.apiVersion = "v1" | .kind = "ConfigMap"
+                   | .metadata = {"name": strenv(APP) + "-images", "namespace": "flux-system"}
+                   | .data."values.yaml" = strenv(VALUES)' > deploy/_images.yaml
+          cat deploy/_images.yaml
+      - name: push bundle, point :main at it
+        env:
+          BUNDLE: ghcr.io/${{ github.repository_owner }}/${{ inputs.app }}-deploy
+          SHA: ${{ github.sha }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          flux push artifact "oci://$BUNDLE:$SHA" --path=deploy --source="$SOURCE" --revision="main@sha1:$SHA"
+          flux tag artifact "oci://$BUNDLE:$SHA" --tag main
+
+  # Repo made with copier and the template has a newer tag? Yellow warning only: `copier update` is optional.
+  template-check:
+    runs-on: ubuntu-latest
+    continue-on-error: true # belt and braces: this job can never fail the pipeline
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          f=.copier-answers.yml # copier writes this: template source + version this repo was made from
+          [ -f "$f" ] || { echo "not made from a copier template: skip"; exit 0; }
+          src=$(yq '._src_path' "$f"); have=$(yq '._commit' "$f")
+          url=${src/#gh:/https://github.com/} # gh:owner/repo -> https://github.com/owner/repo (public: no login)
+          latest=$(git ls-remote --tags --refs --sort=-version:refname "$url" 'v*' | head -1 | sed 's#.*refs/tags/##') || true
+          if [ -z "$latest" ]; then echo "::warning::could not read template tags from $url"; exit 0; fi
+          if [ "$have" != "$latest" ] && [ "$(printf '%s\n' "$have" "$latest" | sort -V | tail -1)" = "$latest" ]; then
+            echo "::warning title=Template update available::$have -> $latest. Optional: run 'copier update' and commit."
+          else
+            echo "template up to date ($have)"
+          fi
+
+  # Make sure homelab's Flux watches this app's bundle. Does nothing if it already does.
+  register:
+    needs: changes
+    if: needs.changes.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: check app name
+        env: { APP: "${{ inputs.app }}" }
+        # becomes a file name and k8s names, so only allow what k8s allows (also blocks ../ tricks)
+        run: |
+          [[ "$APP" =~ ^[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?$ ]] || { echo "bad app name: $APP"; exit 1; }
+
+      - name: get a short-lived token for homelab
+        id: token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.HOMELAB_APP_ID }}
+          private-key: ${{ secrets.HOMELAB_APP_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: homelab # token can only touch this one repo
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ github.repository_owner }}/homelab
+          token: ${{ steps.token.outputs.token }}
+
+      - name: add entry if missing
+        env:
+          APP: ${{ inputs.app }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.repository }} # the calling app repo, e.g. ianrosenr/continuous_learning_project
+        run: |
+          f="clusters/home/apps/$APP.yaml"
+          if [ -f "$f" ]; then echo "already registered: $f"; exit 0; fi
+
+          mkdir -p clusters/home/apps
+          cat > "$f" <<EOF
+          # Written by pipeline-templates (register job), for $REPO.
+          # Tells Flux: watch the bundle labelled :main in GHCR, apply what's inside.
+          apiVersion: source.toolkit.fluxcd.io/v1
+          kind: OCIRepository
+          metadata:
+            name: $APP
+            namespace: flux-system
+          spec:
+            url: oci://ghcr.io/$OWNER/$APP-deploy
+            ref: { tag: main } # the release job moves this label
+            interval: 1m
+            secretRef: { name: ghcr-read } # GHCR read token (cluster Secret, made at Flux bootstrap)
+          ---
+          apiVersion: kustomize.toolkit.fluxcd.io/v1
+          kind: Kustomization
+          metadata:
+            name: $APP
+            namespace: flux-system
+          spec:
+            sourceRef: { kind: OCIRepository, name: $APP }
+            path: ./
+            interval: 5m
+            prune: true # removed from the bundle = removed from cluster (the chart protects the PVC from this)
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$f"
+          git commit -m "register $APP (from $REPO)"
+          # another app's pipeline may have pushed meanwhile: replay on top and retry
+          for _ in 1 2 3; do git pull --rebase -q && git push -q && exit 0; sleep 5; done
+          exit 1

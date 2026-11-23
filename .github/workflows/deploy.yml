@@ -12,6 +12,7 @@
 #         app: my-app
 #         components: '[{"name":"web","lang":"node","dir":".","dockerfile":"apps/web/Dockerfile","context":".","paths":"apps/web"},
 #                       {"name":"api","lang":"python","dir":"apps/api","dockerfile":"apps/api/Dockerfile","context":"apps/api","paths":"apps/api packages"}]'
+#         cluster: home            # optional: homelab cluster folder (default home = homeserver)
 #       secrets: inherit
 #
 # Stages (each only for components whose paths changed):
@@ -36,6 +37,10 @@ on:
           dockerfile, context (build folder), paths (space-separated: a change under any of these re-checks and rebuilds it).
         type: string
         default: '[{"name":"app","lang":"node","dir":".","dockerfile":"Dockerfile","context":".","paths":"."}]'
+      cluster:
+        description: "homelab cluster folder to register in (clusters/<cluster>/apps). Default home = homeserver."
+        type: string
+        default: home
     secrets:
       HOMELAB_APP_ID: { required: true } # the homelab-deployer GitHub App
       HOMELAB_APP_KEY: { required: true } # its private key (PEM)
@@ -254,11 +259,12 @@ jobs:
     if: needs.changes.outputs.release == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: check app name
-        env: { APP: "${{ inputs.app }}" }
-        # becomes a file name and k8s names, so only allow what k8s allows (also blocks ../ tricks)
+      - name: check app + cluster name
+        env: { APP: "${{ inputs.app }}", CLUSTER: "${{ inputs.cluster }}" }
+        # become file/folder names and k8s names, so only allow what k8s allows (also blocks ../ tricks)
         run: |
           [[ "$APP" =~ ^[a-z0-9]([-a-z0-9]{0,40}[a-z0-9])?$ ]] || { echo "bad app name: $APP"; exit 1; }
+          [[ "$CLUSTER" =~ ^[a-z]([a-z0-9-]{0,38}[a-z0-9])?$ ]] || { echo "bad cluster name: $CLUSTER"; exit 1; }
 
       - name: get a short-lived token for homelab
         id: token
@@ -277,13 +283,14 @@ jobs:
       - name: add entry if missing
         env:
           APP: ${{ inputs.app }}
+          CLUSTER: ${{ inputs.cluster }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.repository }} # the calling app repo, e.g. ianrosenr/continuous_learning_project
         run: |
-          f="clusters/home/apps/$APP.yaml"
+          f="clusters/$CLUSTER/apps/$APP.yaml"
           if [ -f "$f" ]; then echo "already registered: $f"; exit 0; fi
 
-          mkdir -p clusters/home/apps
+          mkdir -p "clusters/$CLUSTER/apps"
           cat > "$f" <<EOF
           # Written by pipeline-templates (register job), for $REPO.
           # Tells Flux: watch the bundle labelled :main in GHCR, apply what's inside.
